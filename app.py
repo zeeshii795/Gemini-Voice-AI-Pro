@@ -2,18 +2,23 @@ import streamlit as st
 import google.generativeai as genai
 import sqlite3
 from datetime import datetime
-import requests
+import os
+import tempfile
 
 # --- 1. CONFIGURATION ---
 API_KEY = "AIzaSyBSKA3v0cdcNnmvw4rLMM56-lbde57NysY"
-# Stable v1 path configuration
-genai.configure(api_key=API_KEY, transport='rest')
+# Configure with stable settings
+genai.configure(api_key=API_KEY)
 
 # --- 2. DATABASE ---
 def init_db():
     conn = sqlite3.connect('memories.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute('CREATE TABLE IF NOT EXISTS notes (content TEXT, date TEXT, suggestions TEXT)')
+    c.execute('''CREATE TABLE IF NOT EXISTS notes 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  content TEXT, 
+                  date TEXT, 
+                  suggestions TEXT)''')
     conn.commit()
     return conn, c
 
@@ -31,6 +36,8 @@ st.markdown("""
         color: white; border-radius: 20px; border: none; height: 3.5em; font-weight: bold; width: 100%;
     }
     .result-box { background: rgba(255, 255, 255, 0.1); padding: 20px; border-radius: 15px; border: 1px solid #00d2ff; margin-top: 20px; }
+    .success-box { background: rgba(0, 255, 0, 0.1); padding: 15px; border-radius: 10px; border: 1px solid #00ff00; }
+    .error-box { background: rgba(255, 0, 0, 0.1); padding: 15px; border-radius: 10px; border: 1px solid #ff0000; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -41,56 +48,154 @@ uploaded_file = st.file_uploader("Apni Audio file upload karein", type=['mp3', '
 
 if uploaded_file:
     st.audio(uploaded_file)
+    
     if st.button("Analyze & Suggest 🚀"):
         with st.spinner("Gemini is finding the stable path..."):
             try:
-                # Force stable model path
-                model = genai.GenerativeModel(model_name='gemini-1.5-flash')
+                # Use stable model (gemini-pro is more widely available)
+                model = genai.GenerativeModel('gemini-1.5-flash')
                 
-                audio_data = {
-                    "mime_type": uploaded_file.type,
-                    "data": uploaded_file.read()
-                }
+                # Save uploaded file to temp location
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+                    tmp_file.write(uploaded_file.read())
+                    temp_path = tmp_file.name
                 
-                prompt = "Summarize this audio in Urdu/English mix and give 3 smart suggestions based on context."
-                
-                # API Call
-                response = model.generate_content([prompt, audio_data])
-                
-                if response.text:
-                    st.markdown('<div class="result-box">', unsafe_allow_html=True)
-                    st.subheader("📝 AI Analysis & Suggestions")
-                    st.write(response.text)
-                    st.markdown('</div>', unsafe_allow_html=True)
+                try:
+                    # Upload file to Gemini
+                    upload_response = genai.upload_file(temp_path)
                     
-                    # Save to DB
-                    c.execute("INSERT INTO notes VALUES (?, ?, ?)", 
-                              (response.text, datetime.now().strftime("%Y-%m-%d %H:%M"), "Action Items Included"))
-                    conn.commit()
-                    st.balloons()
+                    # Wait for file to be processed
+                    import time
+                    while upload_response.state.name == "PROCESSING":
+                        time.sleep(1)
+                        upload_response = genai.get_file(upload_response.name)
+                    
+                    if upload_response.state.name == "FAILED":
+                        st.error("File processing failed. Please try again.")
+                    else:
+                        # Prepare prompt
+                        prompt = """
+                        Please analyze this audio and provide:
+                        1. A summary in mix of Urdu and English
+                        2. 3 practical suggestions based on the audio content
+                        3. Key points or action items
+                        
+                        Format output clearly.
+                        """
+                        
+                        # Generate content using file reference
+                        response = model.generate_content([
+                            prompt,
+                            upload_response
+                        ])
+                        
+                        if response.text:
+                            st.markdown('<div class="result-box">', unsafe_allow_html=True)
+                            st.subheader("📝 AI Analysis & Suggestions")
+                            st.write(response.text)
+                            st.markdown('</div>', unsafe_allow_html=True)
+                            
+                            # Save to DB
+                            c.execute("INSERT INTO notes (content, date, suggestions) VALUES (?, ?, ?)", 
+                                      (response.text, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "3 suggestions included"))
+                            conn.commit()
+                            
+                            st.markdown('<div class="success-box">✅ Analysis completed and saved to database!</div>', unsafe_allow_html=True)
+                            st.balloons()
+                
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
                 
             except Exception as e:
-                # Agar phir bhi 404 aaye, toh ye backup rasta hai
-                st.error("Connection issue detected. Trying stable backup...")
-                st.info(f"Technical Log: {str(e)}")
-                st.warning("Please ensure your API Key is unrestricted in Google AI Studio.")
+                st.markdown('<div class="error-box">', unsafe_allow_html=True)
+                st.error("Connection issue detected!")
+                st.write(f"Error details: {str(e)}")
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                # Try alternative model if gemini-1.5-flash fails
+                st.info("Trying alternative model...")
+                try:
+                    alternative_model = genai.GenerativeModel('gemini-pro')
+                    
+                    # Simple text-based fallback
+                    prompt = f"Analyze audio content conceptually. This is for an audio file about: {uploaded_file.name}. Provide summary and suggestions in Urdu/English mix."
+                    response = alternative_model.generate_content(prompt)
+                    
+                    if response.text:
+                        st.markdown('<div class="result-box">', unsafe_allow_html=True)
+                        st.subheader("📝 Fallback Analysis (Text-based)")
+                        st.write(response.text)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                except:
+                    st.error("""
+                    Please check:
+                    1. VPN is TURNED OFF completely
+                    2. API Key is valid and has Gemini API enabled
+                    3. Refresh the page
+                    4. Use Chrome/Edge browser
+                    """)
 
 # --- 5. SIDEBAR ---
 st.sidebar.title("📜 History")
-if st.sidebar.button("Show All Memories"):
+
+# Auto-show recent entries
+st.sidebar.subheader("Recent Memories")
+res = c.execute("SELECT * FROM notes ORDER BY date DESC LIMIT 5").fetchall()
+if res:
+    for r in res:
+        with st.sidebar.expander(f"📅 {r[2][:16]}"):
+            st.write(f"**Content:** {r[1][:200]}..." if len(r[1]) > 200 else f"**Content:** {r[1]}")
+else:
+    st.sidebar.info("Abhi tak koi record nahi hai.")
+
+# Clear button with confirmation
+if st.sidebar.button("Clear All History 🗑️"):
+    if st.sidebar.checkbox("Confirm delete all history?"):
+        c.execute("DELETE FROM notes")
+        conn.commit()
+        st.sidebar.success("History clear ho gayi!")
+        st.rerun()
+
+# Export option
+if st.sidebar.button("Export History 📥"):
     res = c.execute("SELECT * FROM notes ORDER BY date DESC").fetchall()
     if res:
+        export_text = ""
         for r in res:
-            with st.sidebar.expander(f"📅 {r[1]}"):
-                st.write(r[0])
-    else:
-        st.sidebar.info("Abhi tak koi record nahi hai.")
+            export_text += f"\n\nDate: {r[2]}\nContent: {r[1]}\n{'='*50}"
+        
+        st.sidebar.download_button(
+            label="Download History",
+            data=export_text,
+            file_name=f"memories_export_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
+            mime="text/plain"
+        )
 
-if st.sidebar.button("Factory Reset 🗑️"):
-    c.execute("DELETE FROM notes")
-    conn.commit()
-    st.sidebar.success("History clear ho gayi!")
-    st.rerun()
+# --- 6. TROUBLESHOOTING SECTION ---
+with st.sidebar.expander("🚨 Troubleshooting"):
+    st.write("""
+    **Common Issues & Solutions:**
+    
+    1. **404/Model Not Found Error:**
+       - Turn OFF VPN completely
+       - Use browser in incognito mode
+       - Clear browser cache
+    
+    2. **API Key Issues:**
+       - Ensure API key is enabled at: https://makersuite.google.com/app/apikey
+       - Check billing is enabled
+    
+    3. **Audio File Issues:**
+       - Use MP3 format (most reliable)
+       - Keep files under 10MB
+       - Ensure clear audio quality
+    """)
+
+st.sidebar.markdown("---")
+st.sidebar.caption(f"Last updated: {datetime.now().strftime('%H:%M:%S')}")
+
 
 
 
